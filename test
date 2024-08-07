@@ -1,0 +1,66 @@
+const AWS = require('aws-sdk');
+const XLSX = require('xlsx');
+
+const s3 = new AWS.S3();
+
+exports.handler = async (event) => {
+    const bucketName = event.Records[0].s3.bucket.name;
+    const fileName = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
+
+    try {
+        // Step 2: Get the file from S3
+        const fileObject = await s3.getObject({
+            Bucket: bucketName,
+            Key: fileName
+        }).promise();
+
+        const workbook = XLSX.read(fileObject.Body, { type: 'buffer' });
+        const sheetName = workbook.SheetNames[0]; // assuming data is in the first sheet
+        const worksheet = workbook.Sheets[sheetName];
+
+        // Step 3: Validate the specified column (e.g., column B)
+        const columnToValidate = 'B';
+        const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+        const errors = [];
+        let isValid = true;
+
+        // Assuming the first row is headers
+        data[0].push('Valid');
+        for (let i = 1; i < data.length; i++) {
+            const cellValue = data[i][1]; // column B (0-indexed)
+            if (typeof cellValue !== 'number') {
+                isValid = false;
+                data[i].push('Invalid');
+                errors.push({ row: i + 1, value: cellValue });
+            } else {
+                data[i].push('Valid');
+            }
+        }
+
+        // Step 4: Modify the original worksheet
+        const newWorksheet = XLSX.utils.aoa_to_sheet(data);
+        workbook.Sheets[sheetName] = newWorksheet;
+
+        // Step 5: Create a new worksheet for errors
+        if (errors.length > 0) {
+            const errorSheet = XLSX.utils.json_to_sheet(errors);
+            XLSX.utils.book_append_sheet(workbook, errorSheet, 'Errors');
+        }
+
+        // Step 6: Write the updated workbook back to S3
+        const newFileName = fileName.replace('.xlsx', '_validated.xlsx');
+        const newFileBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+
+        await s3.putObject({
+            Bucket: bucketName,
+            Key: `processed/${newFileName}`,
+            Body: newFileBuffer,
+            ContentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        }).promise();
+
+        console.log(`File ${newFileName} has been created and uploaded to S3.`);
+
+    } catch (error) {
+        console.error(`Error processing file ${fileName}: `, error);
+    }
+};

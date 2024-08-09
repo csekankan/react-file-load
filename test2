@@ -1,0 +1,99 @@
+const AWS = require('aws-sdk');
+const XLSX = require('xlsx');
+const { PassThrough } = require('stream');
+
+const s3 = new AWS.S3();
+
+exports.handler = async (event) => {
+    try {
+        // Get the bucket name and object key from the event
+        const bucketName = event.Records[0].s3.bucket.name;
+        const objectKey = event.Records[0].s3.object.key;
+
+        // Create a PassThrough stream to handle streaming data
+        const passThrough = new PassThrough();
+
+        // Set up the S3 getObject request
+        const params = {
+            Bucket: bucketName,
+            Key: objectKey,
+        };
+
+        // Create a stream to read from S3
+        const s3Stream = s3.getObject(params).createReadStream();
+
+        // Pipe the S3 stream data through the PassThrough stream
+        s3Stream.pipe(passThrough);
+
+        let accumulatedData = [];
+        let headers = [];
+        let validationFailed = false;
+
+        // Listen for data chunks
+        passThrough.on('data', (chunk) => {
+            const workbook = XLSX.read(chunk, { type: 'buffer', cellDates: true });
+            const sheetName = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[sheetName];
+            
+            // Convert the XLSX sheet to JSON format
+            const jsonData = XLSX.utils.sheet_to_json(worksheet, { raw: true });
+
+            if (headers.length === 0) {
+                // Assume the first row contains the headers
+                headers = Object.keys(jsonData[0]);
+            }
+
+            // Perform validation on the current chunk of data
+            for (const row of jsonData) {
+                if (validationFailed) break; // Stop if validation already failed
+
+                const validationResult = validateRow(row, headers);
+                if (!validationResult.isValid) {
+                    validationFailed = true; // Set the flag to skip further processing
+                    console.error(`Validation failed for row: ${JSON.stringify(row)} - ${validationResult.error}`);
+                    break;
+                } else {
+                    accumulatedData.push(row); // Accumulate valid rows
+                }
+            }
+        });
+
+        // Listen for the end of the stream
+        passThrough.on('end', () => {
+            if (!validationFailed) {
+                console.log('All data processed successfully:', accumulatedData);
+            } else {
+                console.log('Processing stopped due to validation failure.');
+            }
+        });
+
+        passThrough.on('error', (err) => {
+            console.error('Error processing the stream:', err);
+            throw new Error("Failed to process the stream");
+        });
+
+        return {
+            statusCode: 200,
+            body: JSON.stringify({ message: validationFailed ? "Validation failed, processing stopped." : "Processing completed.", accumulatedData }),
+        };
+
+    } catch (error) {
+        console.error("Error processing the file:", error);
+        return {
+            statusCode: 500,
+            body: JSON.stringify({ error: "Error processing the file" }),
+        };
+    }
+};
+
+function validateRow(row, headers) {
+    for (const header of headers) {
+        // Customize your validation logic
+        if (!row[header]) {
+            return { isValid: false, error: `Missing value for header: ${header}` };
+        }
+    }
+
+    // Return a valid result
+    return { isValid: true };
+}

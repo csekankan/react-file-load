@@ -1,0 +1,121 @@
+const AWS = require('aws-sdk');
+const XLSX = require('xlsx');
+const csv = require('csv-parser'); // Import csv-parser for CSV handling
+const { PassThrough } = require('stream');
+
+const s3 = new AWS.S3();
+
+exports.handler = async (event) => {
+    const bucketName = event.Records[0].s3.bucket.name;
+    const fileName = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
+    
+    try {
+        // Step 1: Get the file from S3
+        const fileObject = await s3.getObject({
+            Bucket: bucketName,
+            Key: fileName
+        }).promise();
+
+        const fileExtension = fileName.split('.').pop().toLowerCase();
+        let errors = [];
+        let isValid = true;
+
+        // Process based on file type
+        if (fileExtension === 'xlsx') {
+            const workbook = XLSX.read(fileObject.Body, { type: 'buffer' });
+            const sheetName = workbook.SheetNames[0]; // assuming data is in the first sheet
+            const worksheet = workbook.Sheets[sheetName];
+            const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+
+            // Validate column B (index 1)
+            data[0].push('Valid');
+            for (let i = 1; i < data.length; i++) {
+                const cellValue = data[i][1]; // column B (0-indexed)
+                if (typeof cellValue !== 'number') {
+                    isValid = false;
+                    data[i].push('Invalid');
+                    errors.push({ row: i + 1, value: cellValue });
+                } else {
+                    data[i].push('Valid');
+                }
+            }
+
+            // Modify the original worksheet
+            const newWorksheet = XLSX.utils.aoa_to_sheet(data);
+            workbook.Sheets[sheetName] = newWorksheet;
+
+            // Create a new worksheet for errors if any
+            if (errors.length > 0) {
+                const errorSheet = XLSX.utils.json_to_sheet(errors);
+                XLSX.utils.book_append_sheet(workbook, errorSheet, 'Errors');
+            }
+
+            // Write the updated workbook back to S3
+            const newFileName = fileName.replace('.xlsx', '_validated.xlsx');
+            const newFileBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+
+            await s3.putObject({
+                Bucket: bucketName,
+                Key: `processed/${newFileName}`,
+                Body: newFileBuffer,
+                ContentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            }).promise();
+
+            console.log(`File ${newFileName} has been created and uploaded to S3.`);
+        
+        } else if (fileExtension === 'csv') {
+            const passThrough = new PassThrough();
+            passThrough.write(fileObject.Body); // Write the S3 file object to PassThrough stream
+
+            const data = [];
+            passThrough.pipe(csv())
+                .on('headers', (headerList) => {
+                    headerList.push('Valid'); // Adding a new header for validation status
+                })
+                .on('data', (row) => {
+                    const cellValue = row.B; // Accessing column B (assuming column B in CSV is accessible via 'B')
+                    if (typeof Number(cellValue) !== 'number' || isNaN(Number(cellValue))) {
+                        isValid = false;
+                        row.Valid = 'Invalid';
+                        errors.push(row);
+                    } else {
+                        row.Valid = 'Valid';
+                    }
+                    data.push(row);
+                })
+                .on('end', async () => {
+                    // Creating a new CSV file with validation status appended
+                    const newFileName = fileName.replace('.csv', '_validated.csv');
+                    const csvOutput = data.map(row => Object.values(row).join(',')).join('\n');
+                    
+                    await s3.putObject({
+                        Bucket: bucketName,
+                        Key: `processed/${newFileName}`,
+                        Body: csvOutput,
+                        ContentType: 'text/csv'
+                    }).promise();
+
+                    console.log(`File ${newFileName} has been created and uploaded to S3.`);
+                    
+                    // If errors exist, write them to a new errors CSV
+                    if (errors.length > 0) {
+                        const errorFileName = newFileName.replace('.csv', '_errors.csv');
+                        const errorOutput = errors.map(error => Object.values(error).join(',')).join('\n');
+
+                        await s3.putObject({
+                            Bucket: bucketName,
+                            Key: `processed/${errorFileName}`,
+                            Body: errorOutput,
+                            ContentType: 'text/csv'
+                        }).promise();
+
+                        console.log(`Error file ${errorFileName} has been created and uploaded to S3.`);
+                    }
+                });
+        } else {
+            throw new Error('Unsupported file type: Only CSV or XLSX files are supported.');
+        }
+    } catch (error) {
+        console.error(`Error processing file ${fileName}: `, error);
+    }
+};
